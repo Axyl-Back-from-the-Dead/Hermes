@@ -170,6 +170,9 @@ NATIVE_FUNCTION(hermesInternalUseEngineQueue)
 NATIVE_FUNCTION(hermesInternalEnqueueJob)
 NATIVE_FUNCTION(hermesInternalDrainJobs)
 
+// #! Pyoncord added
+NATIVE_FUNCTION(hermesInternalGetStrings)
+
 #ifdef HERMES_ENABLE_DEBUGGER
 NATIVE_FUNCTION(isDebuggerAttached)
 NATIVE_FUNCTION(shouldPauseOnThrow)

@@ -451,6 +451,9 @@ STR(setPromiseRejectionTrackingHook, "setPromiseRejectionTrackingHook")
 STR(enablePromiseRejectionTracker, "enablePromiseRejectionTracker")
 STR(spawnAsync, "spawnAsync") /* NOLINT */
 
+// #! Pyoncord added
+STR(getStrings, "getStrings")
+
 STR(require, "require")
 STR(requireFast, "requireFast")
 STR(context, "context")

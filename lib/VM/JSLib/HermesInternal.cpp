@@ -7,10 +7,14 @@
 
 #include "JSLibInternal.h"
 
+#include "hermes/BCGen/HBC/Bytecode.h"
+#include "hermes/BCGen/HBC/BytecodeDisassembler.h"
 #include "hermes/BCGen/HBC/BytecodeFileFormat.h"
+#include "hermes/BCGen/HBC/HBC.h"
 #include "hermes/Support/Base64vlq.h"
 #include "hermes/Support/OSCompat.h"
 #include "hermes/VM/Callable.h"
+#include "hermes/VM/HiddenClass.h"
 #include "hermes/VM/JSArray.h"
 #include "hermes/VM/JSArrayBuffer.h"
 #include "hermes/VM/JSLib.h"
@@ -23,9 +27,108 @@
 
 #include <cstring>
 #include <random>
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <memory>
+#include <system_error>
+#include <cstdlib>
+#include <utility>
 
 namespace hermes {
 namespace vm {
+
+// #! Pyoncord added: Taken from https://github.com/Aliucord/hermes/blob/e3f228be48e54b6eb32a357688ed1323b568bcc6/lib/VM/JSLib/AliuHermes.cpp#L189C1-L279C1
+class StringVisitor : public hbc::BytecodeVisitor {
+ private:
+  inst::OpCode opcode_;
+  uint32_t i_ = 0;
+
+  /// Check if the zero based \p operandIndex in instruction \p opCode is a
+  /// string table ID.
+  static bool isOperandStringID(inst::OpCode opCode, unsigned operandIndex) {
+    #define OPERAND_STRING_ID(name, operandNumber)                     \
+      if (opCode == inst::OpCode::name && operandIndex == operandNumber - 1) \
+        return true;
+    #include "hermes/BCGen/HBC/BytecodeList.def"
+
+    return false;
+  }
+
+ protected:
+  void preVisitInstruction(inst::OpCode opcode, const uint8_t *ip, int length)
+      override {
+    opcode_ = opcode;
+  }
+
+  CallResult<HermesValue> makeStr(
+      ArrayRef<unsigned char> storage,
+      StringTableEntry entry) const {
+    if (entry.isUTF16()) {
+      const auto *s =
+          (const char16_t *)(storage.begin() + entry.getOffset());
+      return StringPrimitive::create(runtime_, UTF16Ref{s, entry.getLength()});
+    } else {
+      const char *s = (const char *)storage.begin() + entry.getOffset();
+      return StringPrimitive::create(runtime_, ASCIIRef{s, entry.getLength()});
+    }
+  }
+
+  void visitString(StringID stringID) {
+    auto storage = bcProvider_->getStringStorage();
+    auto entry = bcProvider_->getStringTableEntry(stringID);
+
+    CallResult<HermesValue> strResult = makeStr(storage, entry);
+
+    auto str = runtime_.makeHandle<StringPrimitive>(*strResult);
+
+    JSArray::setElementAt(array_, runtime_, i_, str);
+    i_++;
+  }
+
+  void visitOperand(
+      const uint8_t *ip,
+      inst::OperandType operandType,
+      const uint8_t *operandBuf,
+      int operandIndex) override {
+    const bool isStringID = isOperandStringID(opcode_, operandIndex);
+    if (!isStringID)
+      return;
+
+    switch (operandType) {
+#define DEFINE_OPERAND_TYPE(name, ctype)         \
+  case inst::OperandType::name: {                      \
+    ctype operandVal;                            \
+    hbc::decodeOperand(operandBuf, &operandVal);      \
+    if (operandType == inst::OperandType::Addr8 ||     \
+        operandType == inst::OperandType::Addr32) {    \
+      /* operandVal is relative to current ip.*/ \
+      return;                                    \
+    }                                            \
+    visitString(operandVal);                     \
+    break;                                       \
+  }
+#include "hermes/BCGen/HBC/BytecodeList.def"
+    }
+  }
+
+  void afterStart() override {
+    if (LLVM_UNLIKELY(
+            JSArray::setLengthProperty(array_, runtime_, i_) ==
+            ExecutionStatus::EXCEPTION)) {
+      (void) runtime_.raiseTypeError(static_cast<const llvh::StringRef>(
+          "Failed to set array length in StringVisitor: " + std::string(strerror(errno))));
+    }
+  }
+
+ public:
+  hermes::vm::Handle<hermes::vm::JSArray> array_;
+  Runtime &runtime_;
+  StringVisitor(
+      std::shared_ptr<hbc::BCProvider> bcProvider,
+      hermes::vm::Handle<hermes::vm::JSArray> array,
+      Runtime &runtime)
+      : BytecodeVisitor(std::move(bcProvider)), array_(std::move(array)), runtime_(runtime) {}
+};
 
 /// \return a SymbolID  for a given C string \p s.
 static inline CallResult<Handle<SymbolID>> symbolForCStr(
@@ -720,6 +823,32 @@ CallResult<HermesValue> hermesInternalEnablePromiseRejectionTracker(
       .toCallResultHermesValue();
 }
 
+// #! Pyoncord added
+// HermesInternal.getStrings(func: () => any): string[]
+CallResult<HermesValue>
+hermesInternalGetStrings(void *, Runtime &runtime, NativeArgs args) {
+  auto func = args.dyncastArg<JSFunction>(0);
+  if (!func) {
+    return runtime.raiseTypeError(
+        "Can't call HermesInternal.getStrings() on non-function");
+  }
+
+  auto funcId = func->getCodeBlock(runtime)->getFunctionID();
+
+  auto arrayResult = JSArray::create(runtime, 0, 0);
+  if (LLVM_UNLIKELY(arrayResult == ExecutionStatus::EXCEPTION)) {
+    return ExecutionStatus::EXCEPTION;
+  }
+
+  auto array = *arrayResult;
+
+  StringVisitor visitor(
+      func->getRuntimeModule(runtime)->getBytecodeSharedPtr(), array, runtime);
+  visitor.visitInstructionsInFunction(funcId);
+
+  return visitor.array_.getHermesValue();
+}
+
 Handle<JSObject> createHermesInternalObject(
     Runtime &runtime,
     const JSLibFlags &flags) {
@@ -815,6 +944,9 @@ Handle<JSObject> createHermesInternalObject(
   defineInternMethod(P::ttiReached, hermesInternalTTIReached);
   defineInternMethod(P::ttrcReached, hermesInternalTTRCReached);
   defineInternMethod(P::getFunctionLocation, hermesInternalGetFunctionLocation);
+
+  // #! Pyoncord added
+  defineInternMethod(P::getStrings, hermesInternalGetStrings);
 
   // HermesInternal function that are only meant to be used for testing purpose.
   // They can change language semantics and are security risks.
